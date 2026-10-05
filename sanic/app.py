@@ -81,6 +81,7 @@ from sanic.models.handler_types import ListenerType, MiddlewareType
 from sanic.models.handler_types import Sanic as SanicVar
 from sanic.request import Request
 from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
+from sanic.rollout import RolloutManager, RouteRollout
 from sanic.router import Router
 from sanic.server.websockets.impl import ConnectionClosed
 from sanic.signals import Event, Signal, SignalRouter
@@ -159,6 +160,7 @@ class Sanic(
         "request_class",
         "request_middleware",
         "response_middleware",
+        "rollouts",
         "router",
         "shared_ctx",
         "signal_router",
@@ -323,6 +325,7 @@ class Sanic(
         self.request_class = request_class or Request
         self.request_middleware: deque[Middleware] = deque()
         self.response_middleware: deque[Middleware] = deque()
+        self.rollouts: RolloutManager = RolloutManager(self)
         self.router: Router = router or Router()
         self.shared_ctx: SharedContext = SharedContext()
         self.signal_router: SignalRouter = signal_router or SignalRouter()
@@ -700,6 +703,37 @@ class Sanic(
             blueprint.strict_slashes = self.strict_slashes
         blueprint.register(self, options)
 
+    def create_rollout(
+        self,
+        name: str,
+        *blueprints: Blueprint,
+        tenant_header: str | None = None,
+        strict_methods: bool = True,
+    ) -> RouteRollout:
+        """创建一个分阶段发布单元（此时尚未生效）。
+
+        典型用法：
+
+        .. code-block:: python
+
+            unit = app.create_rollout("orders-v2", canary_bp)
+            unit.check()                      # 预检查冲突
+            unit.publish(tenants=["internal"])  # 内部租户先行
+            unit.promote(all_tenants=True)   # 逐步扩大到全量
+            unit.rollback()                  # 必要时一次性撤销
+            await unit.drain()               # 等待旧版本排空
+
+        返回的 :class:`~sanic.rollout.RouteRollout` 也可通过
+        ``app.rollouts.get(name)`` 获取。
+        """
+        return RouteRollout(
+            self,
+            name,
+            *blueprints,
+            tenant_header=tenant_header,
+            strict_methods=strict_methods,
+        )
+
     def url_for(self, view_name: str, **kwargs):
         """项目内部接口说明。"""
         # find the route by the supplied view name
@@ -715,7 +749,20 @@ class Sanic(
                 view_name = view_name.replace("static", name)
             kw.update(name=view_name)
 
-        route = self.router.find_route_by_view_name(view_name, **kw)
+        # URL 反向生成跟随当前请求所绑定的路由版本：若请求命中某个
+        # 发布单元，先在该版本的覆盖表中查找，使灰度租户拿到新版本的
+        # URI，而其它租户仍拿到基线 URI。
+        route = None
+        current_request = Request._current.get(None)
+        unit = (
+            getattr(current_request, "_rollout_unit", None)
+            if current_request is not None
+            else None
+        )
+        if unit is not None:
+            route = unit.find_route_by_view_name(view_name)
+        if route is None:
+            route = self.router.find_route_by_view_name(view_name, **kw)
         if not route:
             raise URLBuildError(
                 f"Endpoint with name `{view_name}` was not found"
@@ -876,7 +923,7 @@ class Sanic(
                 "has at least partially been sent."
             )
 
-            handler = self.error_handler._lookup(
+            handler = self._error_handler_for(request)._lookup(
                 exception, request.name if request else None
             )
             if handler:
@@ -912,7 +959,9 @@ class Sanic(
         # No middleware results
         if not response:
             try:
-                response = self.error_handler.response(request, exception)
+                response = self._error_handler_for(request).response(
+                    request, exception
+                )
                 if isawaitable(response):
                     response = await response
             except Exception as e:
@@ -997,12 +1046,31 @@ class Sanic(
                 inline=True,
                 context={"request": request},
             )
-            # Fetch handler from router
-            route, handler, kwargs = self.router.get(
-                request.path,
-                request.method,
-                request.headers.getone("host", None),
+            # Fetch handler from router. 先沿分阶段发布覆盖链按租户解析，
+            # 未命中再回落应用基线路由表。无论命中哪一层，request.route
+            # 都绑定到该请求实际使用的版本，后续中间件、URL 反向生成与
+            # 异常处理全部跟随它。
+            host = request.headers.getone("host", None)
+            rollout_unit = None
+            overlay = self.rollouts.resolve(
+                request, request.path, request.method, host
             )
+            if overlay is not None:
+                (route, handler, kwargs), rollout_unit = overlay
+                # 在途计数用于旧版本排空；版本摘除后在途请求仍持有它。
+                request._rollout_unit = rollout_unit
+                self.rollouts.enter(rollout_unit, request)
+                # 蓝图中间件 + 应用全局中间件合并后固化到该版本路由，
+                # 使 request.respond / handle_exception 自动跟随版本。
+                req_mw, resp_mw = rollout_unit.merged_middleware(self, route)
+                route.extra.request_middleware = req_mw
+                route.extra.response_middleware = resp_mw
+            else:
+                route, handler, kwargs = self.router.get(
+                    request.path,
+                    request.method,
+                    host,
+                )
 
             request._match_info = {**kwargs}
             request.route = route
@@ -1118,6 +1186,19 @@ class Sanic(
             await self.handle_exception(
                 request, e, run_middleware=run_middleware
             )
+        finally:
+            # 请求结束（含异常 / 取消）即离开在途集合，驱动旧版本排空。
+            unit = getattr(request, "_rollout_unit", None)
+            if unit is not None:
+                self.rollouts.leave(unit, request)
+                request._rollout_unit = None
+
+    def _error_handler_for(self, request: Request):
+        """返回请求所绑定路由版本对应的异常处理器。"""
+        unit = getattr(request, "_rollout_unit", None)
+        if unit is not None:
+            return unit.error_handler
+        return self.error_handler
 
     async def _websocket_handler(
         self, handler, request, *args, subprotocols=None, **kwargs

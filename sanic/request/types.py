@@ -106,6 +106,7 @@ class Request(Generic[sanic_type, ctx_type]):
         "_stream_id",
         "_match_info",
         "_name",
+        "_rollout_unit",
         "app",
         "body",
         "conn_info",
@@ -185,6 +186,9 @@ class Request(Generic[sanic_type, ctx_type]):
         self._response_middleware_started = False
         self.responded: bool = False
         self.route: Route | None = None
+        # 当请求命中某个分阶段发布单元时，绑定它；URL 反向生成、异常
+        # 处理与在途排空都跟随该绑定，而不是路由表的当前状态。
+        self._rollout_unit: Any = None
         self.stream: Stream | None = None
         self._match_info: dict[str, Any] = {}
         self._protocol: BaseProtocol | None = None

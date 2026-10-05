@@ -34,6 +34,12 @@ from sanic.response import (
     redirect,
     text,
 )
+from sanic.rollout import (
+    RolloutConflict,
+    RolloutError,
+    RolloutStatus,
+    RouteRollout,
+)
 from sanic.server.websockets.impl import WebsocketImplProtocol as Websocket
 
 
@@ -57,6 +63,11 @@ __all__ = (
     "HTTPResponse",
     "Request",
     "Websocket",
+    # Staged rollout
+    "RouteRollout",
+    "RolloutStatus",
+    "RolloutConflict",
+    "RolloutError",
     # Common types
     "DefaultSanic",
     "DefaultRequest",
